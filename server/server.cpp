@@ -137,6 +137,8 @@ struct Object {
    uint64_t offset = 0, size = 0, va = 0;
    // Command lists: GPU writes into shadows since the last Reset.
    std::vector<Write> writes;
+   // Devices: one CPU-only descriptor that CBVs are built in, see create_view.
+   ID3D12DescriptorHeap *cbv_scratch = nullptr;
 };
 
 // Indexed by id. The client reuses ids, so this stays as large as the most
@@ -735,7 +737,20 @@ static void create_view(Reader &r)
          cbv.BufferLocation = r.u64();
          cbv.SizeInBytes = r.u32();
       }
-      d->CreateConstantBufferView(has ? &cbv : nullptr, dest);
+      // NVIDIA reads a CBV back after writing it, which takes about 3 us in a
+      // shader-visible (write-combined) heap. Built in CPU memory and copied, 0.1 us.
+      if (!dev->cbv_scratch) {
+         D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+         if (FAILED(d->CreateDescriptorHeap(&hd, IID_ID3D12DescriptorHeap, (void **)&dev->cbv_scratch)))
+            dev->cbv_scratch = nullptr;
+      }
+      if (dev->cbv_scratch) {
+         D3D12_CPU_DESCRIPTOR_HANDLE scratch = dev->cbv_scratch->GetCPUDescriptorHandleForHeapStart();
+         d->CreateConstantBufferView(has ? &cbv : nullptr, scratch);
+         d->CopyDescriptorsSimple(1, dest, scratch, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      } else {
+         d->CreateConstantBufferView(has ? &cbv : nullptr, dest);
+      }
       break;
    }
    case VIEW_SRV: {
@@ -1059,6 +1074,8 @@ static void release(uint32_t id)
       o.queue->fence->Release();
       delete o.queue;
    }
+   if (o.cbv_scratch)
+      o.cbv_scratch->Release();
    o.p->Release();
    o = Object();
 }
