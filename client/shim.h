@@ -19,6 +19,7 @@
 /* wire.c: one request at a time, guarded by a global lock taken in msg_begin. */
 void msg_begin(uint32_t op);
 void msg_send(void);  /* queue a request without a reply */
+void msg_send_flush(void);  /* send it and everything queued before it */
 bool msg_call(void);  /* flush and wait for the reply, read it with r_*() */
 /* msg_call() for requests with a fixed answer; ttl_ms 0 caches it for good */
 bool msg_call_cached(unsigned ttl_ms);

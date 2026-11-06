@@ -610,7 +610,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
    w_u32(n);
    for (UINT i = 0; i < n; i++)
       w_obj(lists[i]);
-   msg_send();
+   msg_send_flush();
 }
 
 static void STDMETHODCALLTYPE queue_SetMarker(ID3D12CommandQueue *This, UINT meta, const void *data, UINT size)

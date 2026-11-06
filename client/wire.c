@@ -178,6 +178,15 @@ void msg_send(void)
    pthread_mutex_unlock(&lock);
 }
 
+/* Sends the queued requests now, so the server starts on them while the
+ * caller goes on. */
+void msg_send_flush(void)
+{
+   msg_finish();
+   flush();
+   pthread_mutex_unlock(&lock);
+}
+
 static bool read_full(void *buf, size_t size)
 {
    size_t pos = 0;
