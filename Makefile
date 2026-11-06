@@ -8,7 +8,7 @@ CFLAGS = -std=gnu11 -O2 -g -Wall
 CXXFLAGS = -std=c++17 -O2 -g -Wall
 
 CLIENT = $(patsubst client/%,build/client/%.o,$(wildcard client/*.c client/*.cpp))
-TESTS = build/egltest build/glxtest build/vktest build/vkwsi
+TESTS = build/egltest build/depthflip build/glxtest build/vktest build/vkwsi
 
 all: build/libd3d12.so build/d3d12-shim-server
 
@@ -27,6 +27,9 @@ build/d3d12-shim-server: server/server.cpp proto.h | build
 
 build/egltest: tests/egltest.c | build
 	$(CC) -m32 $(CFLAGS) -o $@ $< -lEGL -lGLESv2
+
+build/depthflip: tests/depthflip.c | build
+	$(CC) -m32 $(CFLAGS) -o $@ $< -lEGL -lOpenGL
 
 build/glxtest: tests/glxtest.c | build
 	$(CC) -m32 $(CFLAGS) -o $@ $< -lGL -lX11
@@ -55,6 +58,7 @@ install: all
 
 check: tests
 	./build/egltest
+	./build/depthflip
 	./build/vktest
 	./build/glxtest
 	./build/vkwsi

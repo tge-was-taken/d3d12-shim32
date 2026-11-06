@@ -13,7 +13,7 @@ install prefix by `make install` and documents the 32-bit Mesa build.
 ```
 make              # build/libd3d12.so (i386) and build/d3d12-shim-server (x86-64)
 make install      # into ~/.local/opt/mesa-dzn32, plus the i686 Vulkan ICD link
-make check        # builds and runs all four tests; glxtest and vkwsi need DISPLAY
+make check        # builds and runs all tests; glxtest and vkwsi need DISPLAY
 make tests && ./build/vktest   # one test
 ```
 
