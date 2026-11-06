@@ -89,6 +89,15 @@ struct queue {
    D3D12_COMMAND_QUEUE_DESC desc;
 };
 
+#define ROOT_PARAMS 64 /* a root signature holds at most 64 DWORDs */
+
+struct root_args {
+   uint64_t table_valid;
+   uint64_t table[ROOT_PARAMS];
+   uint64_t const_valid[ROOT_PARAMS]; /* bit per DWORD */
+   uint32_t constants[ROOT_PARAMS][ROOT_PARAMS];
+};
+
 /* Recorded state used to drop redundant commands. A clear valid bit means
  * the slot's value is unknown and the next set is always sent. */
 struct cmdlist {
@@ -97,6 +106,7 @@ struct cmdlist {
    uint32_t level;
    uint32_t vb_valid;
    D3D12_VERTEX_BUFFER_VIEW vb[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+   struct root_args root[2]; /* graphics, compute */
 };
 
 struct fence {

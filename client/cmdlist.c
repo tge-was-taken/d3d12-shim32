@@ -26,10 +26,18 @@ static HRESULT STDMETHODCALLTYPE cl_Close(CL *This)
    return S_OK;
 }
 
+static void forget_root_args(struct root_args *a)
+{
+   a->table_valid = 0;
+   memset(a->const_valid, 0, sizeof(a->const_valid));
+}
+
 static void forget_state(CL *This)
 {
    struct cmdlist *l = (struct cmdlist *)This;
    l->vb_valid = 0;
+   forget_root_args(&l->root[0]);
+   forget_root_args(&l->root[1]);
 }
 
 static HRESULT STDMETHODCALLTYPE cl_Reset(CL *This, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
@@ -275,6 +283,9 @@ static void STDMETHODCALLTYPE cl_Barrier(CL *This, UINT32 n, const D3D12_BARRIER
 
 static void STDMETHODCALLTYPE cl_SetDescriptorHeaps(CL *This, UINT n, ID3D12DescriptorHeap *const *heaps)
 {
+   struct cmdlist *l = (struct cmdlist *)This;
+   l->root[0].table_valid = 0;
+   l->root[1].table_valid = 0;
    begin(OP_CL_SET_DESC_HEAPS, This);
    w_u32(n);
    for (UINT i = 0; i < n; i++)
@@ -282,8 +293,11 @@ static void STDMETHODCALLTYPE cl_SetDescriptorHeaps(CL *This, UINT n, ID3D12Desc
    msg_send();
 }
 
+/* Root arguments are tracked per bind point and dropped when they are already
+ * set. Setting a root signature, even the same one, forgets them. */
 static void set_root_sig(CL *This, bool compute, ID3D12RootSignature *root)
 {
+   forget_root_args(&((struct cmdlist *)This)->root[compute]);
    begin(OP_CL_SET_ROOT_SIG, This);
    w_u32(compute);
    w_obj(root);
@@ -295,6 +309,14 @@ static void STDMETHODCALLTYPE cl_SetGraphicsRootSignature(CL *This, ID3D12RootSi
 
 static void set_root_table(CL *This, bool compute, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE base)
 {
+   struct root_args *a = &((struct cmdlist *)This)->root[compute];
+   if (index < ROOT_PARAMS) {
+      uint64_t bit = 1ull << index;
+      if (a->table_valid & bit && a->table[index] == base.ptr)
+         return;
+      a->table[index] = base.ptr;
+      a->table_valid |= bit;
+   }
    begin(OP_CL_SET_ROOT_TABLE, This);
    w_u32(compute);
    w_u32(index);
@@ -307,6 +329,14 @@ static void STDMETHODCALLTYPE cl_SetGraphicsRootDescriptorTable(CL *This, UINT i
 
 static void set_root_constants(CL *This, bool compute, UINT index, UINT n, const void *data, UINT offset)
 {
+   struct root_args *a = &((struct cmdlist *)This)->root[compute];
+   if (index < ROOT_PARAMS && n && offset < ROOT_PARAMS && n <= ROOT_PARAMS - offset) {
+      uint64_t mask = (n == 64 ? ~0ull : (1ull << n) - 1) << offset;
+      if ((a->const_valid[index] & mask) == mask && !memcmp(&a->constants[index][offset], data, n * 4))
+         return;
+      memcpy(&a->constants[index][offset], data, n * 4);
+      a->const_valid[index] |= mask;
+   }
    begin(OP_CL_SET_ROOT_CONSTANTS, This);
    w_u32(compute);
    w_u32(index);
