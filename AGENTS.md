@@ -22,7 +22,7 @@ make tests && ./build/vktest   # one test
   `GALLIUM_DRIVER=d3d12` (both set by `~/.profile`).
 - The server path is compiled into the client (`SERVER_PATH`);
   `D3D12_SHIM_SERVER=build/d3d12-shim-server` tests an uninstalled server.
-- `D3D12_SHIM_STATS=1` prints per-op request counts at exit.
+- `D3D12_SHIM_STATS=1` prints per-op request counts and handling time at exit.
 - DirectX headers come from `~/src/mesa-dzn/subprojects/DirectX-Headers-1.0`
   (`DX=` overrides). The 32-bit Mesa is rebuilt with
   `ninja -C ~/src/mesa-dzn/build32 install` using `i386-cross.ini`.

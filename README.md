@@ -52,7 +52,7 @@ with `D3D12_SHIM_SERVER`.
   GetCompletedValue is a memory read.
 - Replies to fixed queries (feature support, allocation info, footprints) are
   cached in the client.
-- `D3D12_SHIM_STATS=1` makes the server print request counts at exit.
+- `D3D12_SHIM_STATS=1` makes the server print request counts and handling time at exit.
 
 ## Performance
 

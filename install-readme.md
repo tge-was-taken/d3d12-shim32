@@ -37,7 +37,7 @@ make -C ~/projects/d3d12-shim32 check        # GL and Vulkan tests, needs DISPLA
 ```
 
 `llvmpipe` in the renderer string means `GALLIUM_DRIVER` is missing.
-`D3D12_SHIM_STATS=1` prints the server's request counts when the app exits.
+`D3D12_SHIM_STATS=1` prints the server's request counts and handling time when the app exits.
 
 ## Rebuild
 

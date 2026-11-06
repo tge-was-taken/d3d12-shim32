@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -2037,13 +2038,20 @@ int main()
    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
    std::thread(wait_loop).detach();
 
-   // D3D12_SHIM_STATS=1 prints how often each request was made, at exit.
+   // D3D12_SHIM_STATS=1 prints how often each request was made and the time
+   // spent handling it, at exit.
    static uint64_t counts[OP_COUNT];
-   if (getenv("D3D12_SHIM_STATS"))
+   static double op_ms[OP_COUNT];
+   bool stats = getenv("D3D12_SHIM_STATS");
+   if (stats)
       atexit([] {
-         for (int op = 0; op < OP_COUNT; op++)
+         double total = 0;
+         for (int op = 0; op < OP_COUNT; op++) {
             if (counts[op])
-               warn("op %d%s: %llu", op, has_reply(op) ? " (sync)" : "", (unsigned long long)counts[op]);
+               warn("op %d%s: %llu %.1f ms", op, has_reply(op) ? " (sync)" : "", (unsigned long long)counts[op], op_ms[op]);
+            total += op_ms[op];
+         }
+         warn("total %.1f ms", total);
       });
 
    int sock = SHIM_SERVER_FD;
@@ -2058,11 +2066,16 @@ int main()
          while (in_end - in_start < total)
             if (!receive(sock))
                exit(0);
-         if (hdr[0] < OP_COUNT)
-            counts[hdr[0]]++;
          Reader r = {in.data() + in_start + 8, hdr[1]};
          Writer w;
-         handle(hdr[0], r, w);
+         if (stats && hdr[0] < OP_COUNT) {
+            auto t = std::chrono::steady_clock::now();
+            handle(hdr[0], r, w);
+            counts[hdr[0]]++;
+            op_ms[hdr[0]] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+         } else {
+            handle(hdr[0], r, w);
+         }
          in_start += total;
          if (has_reply(hdr[0]))
             send_reply(sock, w);
