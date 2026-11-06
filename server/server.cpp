@@ -117,6 +117,7 @@ struct Write {
 struct Submission {
    uint64_t value;
    std::vector<Write> writes;
+   std::vector<IUnknown *> refs;  // released once the GPU is done
 };
 
 // Private fence signalled after each submit. Writes recorded by the submitted
@@ -136,8 +137,14 @@ struct Object {
    // their size and GPU address.
    Shadow *backing = nullptr;
    uint64_t offset = 0, size = 0, va = 0;
-   // Command lists: GPU writes into shadows since the last Reset.
+   // Command lists: GPU writes into shadows since the last Reset, and the
+   // buffers that flipped row copies go through (see flip_flush). Replaced
+   // buffers are kept until the next Reset.
    std::vector<Write> writes;
+   ID3D12Resource *flip_buf[2] = {};
+   D3D12_RESOURCE_STATES flip_state[2] = {};
+   uint64_t flip_size = 0;
+   std::vector<ID3D12Resource *> flip_old;
    // Devices: one CPU-only descriptor that CBVs are built in, see create_view.
    ID3D12DescriptorHeap *cbv_scratch = nullptr;
 };
@@ -373,6 +380,8 @@ static void sync_locked()
             else
                pull_range(it->second, w.start, w.end);
          }
+         for (IUnknown *p : q->pending.front().refs)
+            p->Release();
          q->pending.pop_front();
       }
    }
@@ -1073,10 +1082,18 @@ static void release(uint32_t id)
          queues.erase(std::find(queues.begin(), queues.end(), o.queue));
       }
       o.queue->fence->Release();
+      for (Submission &s : o.queue->pending)
+         for (IUnknown *p : s.refs)
+            p->Release();
       delete o.queue;
    }
    if (o.cbv_scratch)
       o.cbv_scratch->Release();
+   for (auto *b : o.flip_buf)
+      if (b)
+         b->Release();
+   for (auto *b : o.flip_old)
+      b->Release();
    o.p->Release();
    o = Object();
 }
@@ -1120,6 +1137,166 @@ static uint64_t query_size(D3D12_QUERY_TYPE type)
    default:
       return 0;
    }
+}
+
+/* Mesa flips depth images upside down with one CopyTextureRegion per row,
+ * which costs the driver about 16 us each. A run of such copies is replaced
+ * by a copy into a buffer, one CopyBufferRegion per row into a second buffer
+ * in reverse order, and one copy back into the texture. */
+
+static uint64_t flip_rows;  // rows copied through buffers, for D3D12_SHIM_STATS
+
+static struct {
+   Object *list = nullptr, *dst_obj = nullptr;
+   D3D12_TEXTURE_COPY_LOCATION dst, src;
+   UINT x, y, z;  // destination of the first row
+   D3D12_BOX box;  // source of the first row
+   int step = 0;   // source row step; the destination steps the other way
+   UINT count = 0;
+} flip;
+
+static uint8_t plane_count(ID3D12Device *dev, DXGI_FORMAT format)
+{
+   static std::unordered_map<DXGI_FORMAT, uint8_t> planes;
+   auto it = planes.find(format);
+   if (it != planes.end())
+      return it->second;
+   D3D12_FEATURE_DATA_FORMAT_INFO info = {format};
+   if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info))))
+      info.PlaneCount = 0;
+   return planes[format] = info.PlaneCount;
+}
+
+static void transition(CL *l, ID3D12Resource *r, D3D12_RESOURCE_STATES &state, D3D12_RESOURCE_STATES to)
+{
+   D3D12_RESOURCE_BARRIER b = {};
+   b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+   b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, to};
+   l->ResourceBarrier(1, &b);
+   state = to;
+}
+
+static bool flip_through_buffers()
+{
+   Object *o = flip.list;
+   auto *l = static_cast<CL *>(o->p);
+   auto *src = static_cast<ID3D12Resource *>(flip.src.pResource);
+   D3D12_RESOURCE_DESC sd = src->GetDesc();
+   D3D12_RESOURCE_DESC dd = static_cast<ID3D12Resource *>(flip.dst.pResource)->GetDesc();
+   if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || sd.SampleDesc.Count != 1 || dd.Format != sd.Format)
+      return false;
+   ID3D12Device *dev;
+   if (FAILED(l->GetDevice(IID_ID3D12Device, (void **)&dev)))
+      return false;
+   dev->Release();  // the list keeps it alive
+   if (plane_count(dev, sd.Format) != 1)
+      return false;
+
+   D3D12_RESOURCE_DESC rows_desc = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, flip.box.right - flip.box.left, flip.count, 1, 1,
+                                    sd.Format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+   D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+   UINT rows;
+   UINT64 row_size, total;
+   dev->GetCopyableFootprints(&rows_desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+   if (rows != flip.count || total == UINT64_MAX)
+      return false;
+   if (o->flip_size < total) {
+      ID3D12Resource *bufs[2] = {};
+      D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+      D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1,
+                                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+      for (auto *&b : bufs)
+         if (FAILED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_ID3D12Resource, (void **)&b))) {
+            if (bufs[0])
+               bufs[0]->Release();
+            return false;
+         }
+      for (int i = 0; i < 2; i++) {
+         if (o->flip_buf[i])
+            o->flip_old.push_back(o->flip_buf[i]);
+         o->flip_buf[i] = bufs[i];
+         o->flip_state[i] = D3D12_RESOURCE_STATE_COMMON;
+      }
+      o->flip_size = total;
+   }
+
+   ID3D12Resource *a = o->flip_buf[0], *b = o->flip_buf[1];
+   D3D12_TEXTURE_COPY_LOCATION la = {a, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT}, lb = {b, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+   la.PlacedFootprint = lb.PlacedFootprint = fp;
+   UINT last = flip.count - 1;
+   D3D12_BOX box = flip.box;
+   box.top = flip.step > 0 ? flip.box.top : flip.box.top - last;
+   box.bottom = box.top + flip.count;
+   UINT y = flip.step > 0 ? flip.y - last : flip.y;
+
+   if (o->flip_state[0] != D3D12_RESOURCE_STATE_COPY_DEST)
+      transition(l, a, o->flip_state[0], D3D12_RESOURCE_STATE_COPY_DEST);
+   if (o->flip_state[1] != D3D12_RESOURCE_STATE_COPY_DEST)
+      transition(l, b, o->flip_state[1], D3D12_RESOURCE_STATE_COPY_DEST);
+   l->CopyTextureRegion(&la, 0, 0, 0, &flip.src, &box);
+   transition(l, a, o->flip_state[0], D3D12_RESOURCE_STATE_COPY_SOURCE);
+   for (UINT i = 0; i < flip.count; i++)
+      l->CopyBufferRegion(b, (UINT64)(last - i) * fp.Footprint.RowPitch, a, (UINT64)i * fp.Footprint.RowPitch, row_size);
+   transition(l, b, o->flip_state[1], D3D12_RESOURCE_STATE_COPY_SOURCE);
+   l->CopyTextureRegion(&flip.dst, flip.x, y, flip.z, &lb, nullptr);
+   return true;
+}
+
+static void flip_flush()
+{
+   if (!flip.count)
+      return;
+   if (flip.count >= 8 && flip_through_buffers()) {
+      flip_rows += flip.count;
+   } else {
+      auto *l = static_cast<CL *>(flip.list->p);
+      for (UINT i = 0; i < flip.count; i++) {
+         D3D12_BOX box = flip.box;
+         box.top += i * flip.step;
+         box.bottom += i * flip.step;
+         l->CopyTextureRegion(&flip.dst, flip.x, flip.y - i * flip.step, flip.z, &flip.src, &box);
+      }
+   }
+   wrote(flip.list, flip.dst_obj);
+   flip.count = 0;
+}
+
+// Adds a texture copy to the pending run of flipped rows, flushing the run if
+// the copy does not continue it. False if the copy cannot start a run.
+static bool flip_add(Object *o, const D3D12_TEXTURE_COPY_LOCATION &dst, Object *dst_obj, UINT x, UINT y, UINT z,
+                     const D3D12_TEXTURE_COPY_LOCATION &src, const D3D12_BOX *box)
+{
+   bool row = box && box->bottom == box->top + 1 && box->back == box->front + 1 && box->right > box->left &&
+              dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+              dst.pResource && src.pResource && dst.pResource != src.pResource;
+   if (row && flip.count && flip.list == o && flip.dst.pResource == dst.pResource && flip.src.pResource == src.pResource &&
+       flip.dst.SubresourceIndex == dst.SubresourceIndex && flip.src.SubresourceIndex == src.SubresourceIndex &&
+       flip.x == x && flip.z == z && box->left == flip.box.left && box->right == flip.box.right && box->front == flip.box.front) {
+      int ds = (int)box->top - (int)flip.box.top, dd = (int)y - (int)flip.y;
+      if (flip.count == 1 && (ds == 1 || ds == -1) && dd == -ds) {
+         flip.step = ds;
+         flip.count = 2;
+         return true;
+      }
+      if (flip.count > 1 && ds == flip.step * (int)flip.count && dd == -ds) {
+         flip.count++;
+         return true;
+      }
+   }
+   flip_flush();
+   if (!row)
+      return false;
+   flip.list = o;
+   flip.dst_obj = dst_obj;
+   flip.dst = dst;
+   flip.src = src;
+   flip.x = x;
+   flip.y = y;
+   flip.z = z;
+   flip.box = *box;
+   flip.count = 1;
+   return true;
 }
 
 template <class T> static const T *optional(Reader &r, T *v)
@@ -1217,6 +1394,10 @@ static void command(uint32_t op, Reader &r, Writer &w)
    }
    case OP_CL_RESET: {
       o->writes.clear();
+      for (auto *b : o->flip_old)
+         b->Release();
+      o->flip_old.clear();
+      o->flip_state[0] = o->flip_state[1] = D3D12_RESOURCE_STATE_COMMON;
       auto *alloc = lookup<ID3D12CommandAllocator>(r.u32());
       HRESULT hr = l->Reset(alloc, lookup<ID3D12PipelineState>(r.u32()));
       if (FAILED(hr))
@@ -1257,7 +1438,10 @@ static void command(uint32_t op, Reader &r, Writer &w)
       uint32_t x = r.u32(), y = r.u32(), z = r.u32();
       auto src = copy_location(r, &src_obj);
       D3D12_BOX box;
-      l->CopyTextureRegion(&dst, x, y, z, &src, optional(r, &box));
+      const D3D12_BOX *pbox = optional(r, &box);
+      if (flip_add(o, dst, dst_obj, x, y, z, src, pbox))
+         break;
+      l->CopyTextureRegion(&dst, x, y, z, &src, pbox);
       if (dst.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
          const auto &f = dst.PlacedFootprint.Footprint;
          wrote(o, dst_obj, dst.PlacedFootprint.Offset, (uint64_t)f.RowPitch * f.Height * f.Depth);
@@ -1645,6 +1829,8 @@ static bool has_reply(uint32_t op)
 
 static void handle(uint32_t op, Reader &r, Writer &w)
 {
+   if (op != OP_CL_COPY_TEXTURE)
+      flip_flush();
    if (op >= OP_DXCORE_FACTORY && op <= OP_ADAPTER_QUERY_STATE)
       return dxcore(op, r, w);
    if (op >= OP_CL_CLOSE && op < OP_COUNT)
@@ -1877,19 +2063,27 @@ static void handle(uint32_t op, Reader &r, Writer &w)
       uint32_t n = r.u32();
       std::vector<ID3D12CommandList *> lists(n);
       std::vector<Write> writes;
+      std::vector<IUnknown *> refs;
       for (auto &l : lists) {
          Object *o = find(r.u32());
          l = o ? static_cast<ID3D12CommandList *>(o->p) : nullptr;
-         if (o)
-            writes.insert(writes.end(), o->writes.begin(), o->writes.end());
+         if (!o)
+            continue;
+         writes.insert(writes.end(), o->writes.begin(), o->writes.end());
+         for (auto *b : o->flip_buf)
+            if (b)
+               refs.push_back(b);
+         refs.insert(refs.end(), o->flip_old.begin(), o->flip_old.end());
       }
+      for (IUnknown *p : refs)
+         p->AddRef();
       auto *queue = static_cast<ID3D12CommandQueue *>(q->p);
       queue->ExecuteCommandLists(n, lists.data());
       std::lock_guard<std::mutex> g(sync_lock);
       Queue *pq = q->queue;
       queue->Signal(pq->fence, ++pq->submitted);
-      if (!writes.empty())
-         pq->pending.push_back({pq->submitted, std::move(writes)});
+      if (!writes.empty() || !refs.empty())
+         pq->pending.push_back({pq->submitted, std::move(writes), std::move(refs)});
       break;
    }
    case OP_QUEUE_SIGNAL:
@@ -2052,6 +2246,7 @@ int main()
             total += op_ms[op];
          }
          warn("total %.1f ms", total);
+         warn("rows flipped through buffers: %llu", (unsigned long long)flip_rows);
       });
 
    int sock = SHIM_SERVER_FD;
