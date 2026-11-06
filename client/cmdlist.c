@@ -26,8 +26,15 @@ static HRESULT STDMETHODCALLTYPE cl_Close(CL *This)
    return S_OK;
 }
 
+static void forget_state(CL *This)
+{
+   struct cmdlist *l = (struct cmdlist *)This;
+   l->vb_valid = 0;
+}
+
 static HRESULT STDMETHODCALLTYPE cl_Reset(CL *This, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
+   forget_state(This);
    begin(OP_CL_RESET, This);
    w_obj(alloc);
    w_obj(pso);
@@ -37,6 +44,7 @@ static HRESULT STDMETHODCALLTYPE cl_Reset(CL *This, ID3D12CommandAllocator *allo
 
 static void STDMETHODCALLTYPE cl_ClearState(CL *This, ID3D12PipelineState *pso)
 {
+   forget_state(This);
    begin(OP_CL_CLEAR_STATE, This);
    w_obj(pso);
    msg_send();
@@ -342,7 +350,7 @@ static void STDMETHODCALLTYPE cl_IASetIndexBuffer(CL *This, const D3D12_INDEX_BU
    msg_send();
 }
 
-static void STDMETHODCALLTYPE cl_IASetVertexBuffers(CL *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views)
+static void set_vertex_buffers(CL *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views)
 {
    begin(OP_CL_VERTEX_BUFFERS, This);
    w_u32(start);
@@ -351,6 +359,36 @@ static void STDMETHODCALLTYPE cl_IASetVertexBuffers(CL *This, UINT start, UINT n
    if (views)
       w_raw(views, n * sizeof(*views), 8);
    msg_send();
+}
+
+static bool vb_bound(const struct cmdlist *l, UINT slot, const D3D12_VERTEX_BUFFER_VIEW *view)
+{
+   return (l->vb_valid >> slot) & 1 && !memcmp(&l->vb[slot], view, sizeof(*view));
+}
+
+/* The driver rebinds every view passed if any of them changed, and Mesa
+ * passes all slots when one changes, so send only the runs that differ. */
+static void STDMETHODCALLTYPE cl_IASetVertexBuffers(CL *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+   struct cmdlist *l = (struct cmdlist *)This;
+   if (!views || start > ARRAY_SIZE(l->vb) || n > ARRAY_SIZE(l->vb) - start) {
+      l->vb_valid = 0;
+      set_vertex_buffers(This, start, n, views);
+      return;
+   }
+   for (UINT i = 0; i < n;) {
+      if (vb_bound(l, start + i, &views[i])) {
+         i++;
+         continue;
+      }
+      UINT first = i;
+      while (i < n && !vb_bound(l, start + i, &views[i])) {
+         l->vb[start + i] = views[i];
+         l->vb_valid |= 1u << (start + i);
+         i++;
+      }
+      set_vertex_buffers(This, start + first, i - first, views + first);
+   }
 }
 
 static void STDMETHODCALLTYPE cl_SOSetTargets(CL *This, UINT start, UINT n, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views)

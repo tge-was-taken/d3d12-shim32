@@ -89,10 +89,14 @@ struct queue {
    D3D12_COMMAND_QUEUE_DESC desc;
 };
 
+/* Recorded state used to drop redundant commands. A clear valid bit means
+ * the slot's value is unknown and the next set is always sent. */
 struct cmdlist {
    struct obj o;
    D3D12_COMMAND_LIST_TYPE type;
    uint32_t level;
+   uint32_t vb_valid;
+   D3D12_VERTEX_BUFFER_VIEW vb[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
 };
 
 struct fence {
