@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -492,8 +493,13 @@ template <class F> static HRESULT watch(int client, F set_event)
    HRESULT hr = set_event((HANDLE)(intptr_t)event);
    if (FAILED(hr)) {
       close(event);
-      if (client >= 0)
+      if (client >= 0) {
+         // Wake the client rather than leave it waiting forever.
+         uint64_t one = 1;
+         if (write(client, &one, sizeof(one)) < 0)
+            warn("cannot signal client event");
          close(client);
+      }
       return hr;
    }
    epoll_event ev = {};
@@ -501,6 +507,47 @@ template <class F> static HRESULT watch(int client, F set_event)
    ev.data.ptr = new Waiter{event, client};
    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event, &ev);
    return hr;
+}
+
+/* SetEventOnCompletion takes about 70 us, so a thread makes those calls and
+ * the request thread only queues them. */
+
+struct FenceWatch {
+   ID3D12Fence *fence;  // referenced
+   uint64_t value;
+   int client;  // eventfd to signal, or -1
+};
+
+// Never destroyed: at exit the condition variable's destructor would wait for
+// the thread blocked on it.
+struct WatchQueue {
+   std::mutex lock;
+   std::condition_variable cond;
+   std::deque<FenceWatch> items;
+};
+static WatchQueue &watches = *new WatchQueue;
+
+static void watch_loop()
+{
+   for (;;) {
+      std::unique_lock<std::mutex> g(watches.lock);
+      watches.cond.wait(g, [] { return !watches.items.empty(); });
+      FenceWatch fw = watches.items.front();
+      watches.items.pop_front();
+      g.unlock();
+      HRESULT hr = watch(fw.client, [&](HANDLE e) { return fw.fence->SetEventOnCompletion(fw.value, e); });
+      if (FAILED(hr))
+         warn("SetEventOnCompletion failed: %#x", (unsigned)hr);
+      fw.fence->Release();
+   }
+}
+
+static void watch_later(ID3D12Fence *fence, uint64_t value, int client)
+{
+   fence->AddRef();
+   std::lock_guard<std::mutex> g(watches.lock);
+   watches.items.push_back({fence, value, client});
+   watches.cond.notify_one();
 }
 
 // Publishes the fence's value once it reaches `value`.
@@ -511,7 +558,7 @@ static void watch_fence(uint32_t id, ID3D12Fence *fence, uint64_t value)
       if (!published.count(id))
          return;
    }
-   watch(-1, [&](HANDLE e) { return fence->SetEventOnCompletion(value, e); });
+   watch_later(fence, value, -1);
 }
 
 /* Root signatures and pipelines */
@@ -1820,6 +1867,7 @@ static bool has_reply(uint32_t op)
    case OP_QUEUE_EXECUTE:
    case OP_QUEUE_SIGNAL:
    case OP_QUEUE_WAIT:
+   case OP_FENCE_SET_EVENT:
    case OP_ALLOCATOR_RESET:
       return false;
    default:
@@ -2128,7 +2176,14 @@ static void handle(uint32_t op, Reader &r, Writer &w)
       auto *fence = lookup<ID3D12Fence>(r.u32());
       uint64_t value = r.u64();
       int fd = take_fd();
-      w.put(watch(fd, [&](HANDLE e) { return fence->SetEventOnCompletion(value, e); }));
+      if (fence) {
+         watch_later(fence, value, fd);
+      } else if (fd >= 0) {
+         uint64_t one = 1;
+         if (write(fd, &one, sizeof(one)) < 0)
+            warn("cannot signal client event");
+         close(fd);
+      }
       break;
    }
    case OP_FENCE_SIGNAL: {
@@ -2231,6 +2286,7 @@ int main()
 
    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
    std::thread(wait_loop).detach();
+   std::thread(watch_loop).detach();
 
    // D3D12_SHIM_STATS=1 prints how often each request was made and the time
    // spent handling it, at exit.

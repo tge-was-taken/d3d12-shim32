@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -163,7 +164,7 @@ static void msg_finish(void)
    w_align(8);
 }
 
-/* Requests that carry fds expect a reply, so at most one fd is ever pending. */
+/* Requests that carry fds are sent at once, so at most one fd is ever pending. */
 void msg_fd(int fd)
 {
    if (nfds < MAX_FDS)
@@ -185,6 +186,15 @@ void msg_send_flush(void)
    msg_finish();
    flush();
    pthread_mutex_unlock(&lock);
+}
+
+/* Waits until fd is readable or the server is gone. */
+void msg_wait_fd(int fd)
+{
+   struct pollfd p[2] = {{fd, POLLIN, 0}, {sock, POLLRDHUP, 0}};
+   while (!dead && !p[0].revents && !(p[1].revents & (POLLRDHUP | POLLHUP | POLLERR)))
+      if (poll(p, 2, -1) < 0 && errno != EINTR)
+         break;
 }
 
 static bool read_full(void *buf, size_t size)

@@ -25,6 +25,7 @@ bool msg_call(void);  /* flush and wait for the reply, read it with r_*() */
 bool msg_call_cached(unsigned ttl_ms);
 void msg_end(void);   /* release the lock after reading a reply */
 void msg_fd(int fd);  /* pass an fd along with the current request */
+void msg_wait_fd(int fd);
 bool server_lost(void);
 
 void w_blob(const void *p, size_t size);

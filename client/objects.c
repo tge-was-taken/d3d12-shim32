@@ -1,7 +1,5 @@
 #define _GNU_SOURCE
 #define INITGUID
-#include <errno.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -550,13 +548,6 @@ static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence1 *This)
    return v;
 }
 
-static void wait_fd(int fd)
-{
-   struct pollfd p = {fd, POLLIN, 0};
-   while (poll(&p, 1, -1) < 0 && errno == EINTR)
-      ;
-}
-
 static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence1 *This, UINT64 value, HANDLE event)
 {
    struct fence *f = (struct fence *)This;
@@ -565,22 +556,22 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence1 *This, 
          eventfd_write((int)(intptr_t)event, 1);
       return S_OK;
    }
+   /* The server signals the event when the fence reaches the value, or at
+    * once if it cannot watch the fence. */
    int fd = event ? (int)(intptr_t)event : eventfd(0, EFD_CLOEXEC);
    msg_begin(OP_FENCE_SET_EVENT);
    w_obj(This);
    w_u64(value);
    msg_fd(fd);
-   bool alive = msg_call();
-   HRESULT hr = r_hr();
-   msg_end();
-   if (!alive && event)
-      eventfd_write(fd, 1);
-   if (!event) {
-      if (SUCCEEDED(hr))
-         wait_fd(fd);
+   msg_send_flush();
+   if (event) {
+      if (server_lost())
+         eventfd_write(fd, 1);
+   } else {
+      msg_wait_fd(fd);
       close(fd);
    }
-   return hr;
+   return S_OK;
 }
 
 /* Waits for the server, which publishes the new value before replying. */
