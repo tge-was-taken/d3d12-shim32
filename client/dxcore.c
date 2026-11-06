@@ -184,8 +184,9 @@ static HRESULT adapter_QueryState(Obj *This, uint32_t state, size_t in_size, con
    w_u32(state);
    w_blob(in, in_size);
    w_u32(out_size);
-   /* Mostly memory budget polling, which may be slightly stale. */
-   msg_call_cached(100);
+   /* Mostly memory budget polling (Mesa asks on every submit), which may be
+    * stale by a second. */
+   msg_call_cached(1000);
    HRESULT hr = r_hr();
    if (SUCCEEDED(hr))
       r_blob(out, out_size);
