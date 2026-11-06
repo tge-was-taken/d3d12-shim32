@@ -949,6 +949,10 @@ static void create_resource(Reader &r, Writer &w)
    const D3D12_CLEAR_VALUE *pclear = has_clear ? &clear : nullptr;
    uint32_t ncast = r.u32();
    auto *cast = r.array<DXGI_FORMAT>(ncast);
+   // D3D12 rejects formats with a stencil plane (R24G8_TYPELESS, D24S8, D32S8)
+   // with E_INVALIDARG when given a non-null list of zero formats.
+   if (!ncast)
+      cast = nullptr;
    uint32_t access = r.u32();
    uint64_t shadow_offset = access ? r.u64() : 0;
    int fd = access ? take_fd() : -1;

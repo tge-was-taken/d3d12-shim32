@@ -37,7 +37,8 @@ static GLuint depth_fb(GLenum format)
    glTexStorage2D(GL_TEXTURE_2D, 1, format, W, H);
    glGenFramebuffers(1, &fb);
    glBindFramebuffer(GL_FRAMEBUFFER, fb);
-   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, tex, 0);
+   GLenum attachment = format == GL_DEPTH24_STENCIL8 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+   glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, tex, 0);
    glDrawBuffer(GL_NONE);
    glReadBuffer(GL_NONE);
    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -132,6 +133,7 @@ int main(void)
    fails += test("D32F full", GL_DEPTH_COMPONENT32F, 0, 0, W, H, 0, 0);
    fails += test("D32F box", GL_DEPTH_COMPONENT32F, 24, 10, 100, 70, 8, 30);
    fails += test("D16 full", GL_DEPTH_COMPONENT16, 0, 0, W, H, 0, 0);
+   fails += test("D24S8 full", GL_DEPTH24_STENCIL8, 0, 0, W, H, 0, 0);
    fails += test("D32F 5 rows", GL_DEPTH_COMPONENT32F, 0, 50, W, 5, 0, 7);
 
    printf(fails ? "FAILED\n" : "PASSED\n");
